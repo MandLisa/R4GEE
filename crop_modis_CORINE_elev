@@ -1,0 +1,86 @@
+library(sf)
+library(terra)
+
+# ============================================================
+# 0) PATHS / SETTINGS
+# ============================================================
+# Inputs
+corine_gpkg <- "/mnt/eo/Capra_ibex/_data/CORINE/CORINE_mask.gpkg"
+elev_gpkg   <- "/mnt/eo/Capra_ibex/_data/DEM/elev_mask.gpkg"
+
+corine_layer <- st_layers(corine_gpkg)$name[1]
+elev_layer   <- st_layers(elev_gpkg)$name[1]
+
+# Output: CORINE mask with elev areas removed
+mask_out_gpkg  <- "/mnt/eo/Capra_ibex/_data/CORINE/CORINE_mask_minus_elev.gpkg"
+mask_out_layer <- "corine_minus_elev"
+
+# Rasters
+ras_dir     <- "/mnt/eo/Capra_ibex/_data/MODIS"
+ras_pattern <- "_cropped\\.tif$"
+
+# Output rasters (DO NOT overwrite originals)
+out_ras_dir <- "/mnt/eo/Capra_ibex/_data/MODIS/mask"
+dir.create(out_ras_dir, showWarnings = FALSE, recursive = TRUE)
+out_suffix  <- "_corineMinusElev.tif"
+
+# ============================================================
+# 1) BUILD FINAL MASK: CORINE minus elevation polygons
+# ============================================================
+cor <- st_read(corine_gpkg, layer = corine_layer, quiet = TRUE)
+elv <- st_read(elev_gpkg,   layer = elev_layer,   quiet = TRUE)
+
+# CRS alignment
+if (st_crs(cor) != st_crs(elv)) {
+  elv <- st_transform(elv, st_crs(cor))
+}
+
+# geometry validity
+cor <- st_make_valid(cor)
+elv <- st_make_valid(elv)
+
+# dissolve elevation mask (faster + avoids repeated subtraction)
+elv_u <- st_union(elv)
+
+# optional speed-up: limit elev union to CORINE bbox
+elv_u <- st_intersection(elv_u, st_as_sfc(st_bbox(cor)))
+
+# erase
+cor_cut <- st_difference(cor, elv_u)
+cor_cut <- st_make_valid(cor_cut)
+cor_cut <- cor_cut[!st_is_empty(cor_cut), ]
+
+# write final mask gpkg (overwrite safely)
+if (file.exists(mask_out_gpkg)) unlink(mask_out_gpkg)
+st_write(cor_cut, mask_out_gpkg, layer = mask_out_layer, quiet = TRUE)
+cat("Wrote final mask:\n", mask_out_gpkg, "\nLayer: ", mask_out_layer, "\n", sep="")
+
+# convert to terra vect
+mask_v <- vect(cor_cut)
+mask_v <- makeValid(mask_v)
+mask_v <- aggregate(mask_v)  # dissolve for faster crop/mask
+
+# ============================================================
+# 2) CROP + MASK RASTER STACKS TO FINAL MASK
+# ============================================================
+tif_files <- list.files(ras_dir, pattern = ras_pattern, full.names = TRUE, recursive = TRUE)
+stopifnot(length(tif_files) > 0)
+cat("Found", length(tif_files), "rasters to crop/mask.\n")
+
+for (f in tif_files) {
+  message("\n--- Processing: ", f)
+  r <- rast(f)
+  
+  # reproject mask to raster CRS if needed
+  mask_r <- if (!same.crs(r, mask_v)) project(mask_v, crs(r)) else mask_v
+  
+  r2 <- crop(r, mask_r)
+  r2 <- mask(r2, mask_r)
+  
+  out_file <- file.path(out_ras_dir, paste0(tools::file_path_sans_ext(basename(f)), out_suffix))
+  writeRaster(r2, out_file, overwrite = TRUE)
+  
+  message("Wrote: ", out_file)
+}
+
+message("\nDone. Masked rasters in: ", out_ras_dir)
