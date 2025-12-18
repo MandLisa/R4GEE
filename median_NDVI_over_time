@@ -1,0 +1,90 @@
+library(terra)
+
+# r_all: SpatRaster with layer names like NDVI_20060610, NDVI_20060618, ...
+# If you haven't created it yet, you can do so via c(rast(file1), rast(file2), ...)
+ndvi_dir   <- "/mnt/eo/Capra_ibex/_data/MODIS/mask/"  # directory containing yearly NDVI stacks
+file_regex <- "\\.tif$"
+
+files <- sort(list.files(ndvi_dir, pattern = file_regex, full.names = TRUE))
+stopifnot(length(files) > 0)
+
+r_list <- lapply(files, rast)
+
+# Sanity: enforce identical geometry (extent/res/crs) across stacks
+# ---- geometry check (terra-compatible) ----
+geom_ref <- r_list[[1]]
+
+ok <- vapply(r_list, function(x) {
+  compareGeom(geom_ref, x, stopOnError = FALSE)
+}, logical(1))
+
+if (!all(ok)) {
+  bad_idx <- which(!ok)
+  message("Some stacks do not match geometry. Showing diagnostics for the first few:")
+  for (i in head(bad_idx, 5)) {
+    cat("\n--- File:", files[i], "\n")
+    cat("CRS equal:   ", identical(crs(r_list[[i]]), crs(geom_ref)), "\n")
+    cat("Extent eq:  ", isTRUE(all.equal(ext(r_list[[i]]), ext(geom_ref))), "\n")
+    cat("Res eq:     ", isTRUE(all.equal(res(r_list[[i]]), res(geom_ref))), "\n")
+    cat("nrow/ncol:  ", nrow(r_list[[i]]), ncol(r_list[[i]]),
+        " vs ref ", nrow(geom_ref), ncol(geom_ref), "\n")
+  }
+  stop("Fix geometry mismatches (e.g., resample/crop/project) before stacking.")
+}
+
+# ---------------------------
+# 2) Concatenate all layers
+# ---------------------------
+r_all <- do.call(c, r_list)
+
+
+nm <- names(r_all)
+
+# 1) Parse acquisition dates from layer names
+dates <- as.Date(sub("^NDVI_", "", nm), format = "%Y%m%d")
+yrs   <- as.integer(format(dates, "%Y"))
+
+# 2) For each year: find layer closest to June 15 of that year
+unique_years <- sort(unique(yrs))
+
+closest_idx <- integer(length(unique_years))
+
+for (i in seq_along(unique_years)) {
+  yy <- unique_years[i]
+  target <- as.Date(sprintf("%d-06-15", yy))
+  
+  idx_y <- which(yrs == yy)
+  dists <- abs(as.integer(dates[idx_y] - target))  # distance in days
+  
+  # if tie (two equally close dates), choose the earlier one:
+  min_dist <- min(dists, na.rm = TRUE)
+  tied <- idx_y[dists == min_dist]
+  closest_idx[i] <- tied[which.min(dates[tied])]   # earliest date among ties
+}
+
+# 3) Subset those "closest-to-15-June" layers
+r_jun15 <- r_all[[closest_idx]]
+
+# Optional sanity check: which dates were selected?
+selected <- data.frame(
+  year = unique_years,
+  selected_date = dates[closest_idx],
+  layer_name = names(r_all)[closest_idx]
+)
+print(selected)
+
+# 4) If your missing data are coded (e.g., -10000), set them to NA before median
+# r_jun15[r_jun15 == -10000] <- NA
+
+# 5) Pixel-wise median across years
+out_file <- "/mnt/eo/Capra_ibex/_phenology_output/NDVI_median_June15.tif"
+
+ndvi_median_jun15 <- app(
+  r_jun15,
+  fun = function(x) median(x, na.rm = TRUE),
+  filename = out_file,
+  overwrite = TRUE,
+  wopt = list(datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+)
+
+plot(ndvi_median_jun15, main = "Median NDVI (closest layer to 15 June, 2006–2024)")
