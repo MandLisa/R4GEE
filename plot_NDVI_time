@@ -1,0 +1,213 @@
+# ============================================================
+# Multi-year NDVI stacks (Apr–Oct, 2006–2024):
+#  - stack all yearly stacks
+#  - parse dates from layer names NDVI_YYYYMMDD
+#  - sort layers by date
+#  - extract NDVI for a few points
+#  - plot points + fitted line
+# ============================================================
+
+library(terra)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+
+# ---------------------------
+# User settings
+# ---------------------------
+ndvi_dir   <- "/mnt/eo/Capra_ibex/_data/MODIS/mask/"  # directory containing yearly NDVI stacks
+file_regex <- "\\.tif$"                    # adapt if needed
+n_points   <- 5                            # "a few" points
+seed       <- 42
+
+# If your NDVI is scaled (common: 10000), set scale_factor accordingly.
+# If you are unsure: print range(values(r_all)) later and decide.
+scale_factor <- 1   # e.g., 10000 if your NDVI is stored as int * 10000
+
+# Optional: set to a filename if you want to write the stacked raster to disk (recommended for big AOIs)
+out_stack_file <- "/mnt/eo/Capra_ibex/_data/MODIS/stack"  # e.g., "/path/to/out/NDVI_2006_2024_AprOct_sorted.tif" (or leave "" for in-memory)
+
+# ---------------------------
+# 1) Read yearly stacks
+# ---------------------------
+files <- sort(list.files(ndvi_dir, pattern = file_regex, full.names = TRUE))
+stopifnot(length(files) > 0)
+
+r_list <- lapply(files, rast)
+
+# Sanity: enforce identical geometry (extent/res/crs) across stacks
+# ---- geometry check (terra-compatible) ----
+geom_ref <- r_list[[1]]
+
+ok <- vapply(r_list, function(x) {
+  compareGeom(geom_ref, x, stopOnError = FALSE)
+}, logical(1))
+
+if (!all(ok)) {
+  bad_idx <- which(!ok)
+  message("Some stacks do not match geometry. Showing diagnostics for the first few:")
+  for (i in head(bad_idx, 5)) {
+    cat("\n--- File:", files[i], "\n")
+    cat("CRS equal:   ", identical(crs(r_list[[i]]), crs(geom_ref)), "\n")
+    cat("Extent eq:  ", isTRUE(all.equal(ext(r_list[[i]]), ext(geom_ref))), "\n")
+    cat("Res eq:     ", isTRUE(all.equal(res(r_list[[i]]), res(geom_ref))), "\n")
+    cat("nrow/ncol:  ", nrow(r_list[[i]]), ncol(r_list[[i]]),
+        " vs ref ", nrow(geom_ref), ncol(geom_ref), "\n")
+  }
+  stop("Fix geometry mismatches (e.g., resample/crop/project) before stacking.")
+}
+
+# ---------------------------
+# 2) Concatenate all layers
+# ---------------------------
+r_all <- do.call(c, r_list)
+
+# ---------------------------
+# 3) Parse dates from layer names and sort
+# ---------------------------
+nm <- names(r_all)
+
+# Expect names like "NDVI_20060407" (as in your screenshot)
+date_str <- sub("^.*_(\\d{8})$", "\\1", nm)
+if (any(!grepl("^\\d{8}$", date_str))) {
+  bad_names <- nm[!grepl("^.*_\\d{8}$", nm)]
+  stop(
+    "Some layer names do not match the expected pattern '*_YYYYMMDD'. Examples:\n",
+    paste(head(bad_names, 10), collapse = "\n")
+  )
+}
+
+dates <- as.Date(date_str, format = "%Y%m%d")
+ord   <- order(dates)
+
+r_all <- r_all[[ord]]
+dates <- dates[ord]
+names(r_all) <- paste0("NDVI_", format(dates, "%Y%m%d"))
+
+# Optional: write sorted stack to disk (useful if large)
+if (nzchar(out_stack_file)) {
+  r_all <- writeRaster(r_all, out_stack_file, overwrite = TRUE)
+}
+
+# ---------------------------
+# 4) Pick a few points (random within valid NDVI pixels)
+#     If you already have points (sf/vect), replace this block.
+# ---------------------------
+set.seed(seed)
+pts <- spatSample(r_all[[1]], size = n_points, method = "random",
+                  as.points = TRUE, na.rm = TRUE, values = FALSE)
+pts$pt_id <- paste0("P", seq_len(n_points))
+
+# ---------------------------
+# 5) Extract NDVI time series for points
+# ---------------------------
+# This returns a wide data.frame: one row per point, one column per layer
+x <- terra::extract(r_all, pts, ID = TRUE)
+
+# Convert to long table: (pt_id, date, ndvi)
+dt <- as.data.table(x)
+dt[, pt_id := pts$pt_id[match(ID, seq_len(nrow(pts)))]]
+dt_long <- melt(dt,
+                id.vars = c("ID", "pt_id"),
+                variable.name = "layer",
+                value.name = "ndvi_raw")
+
+# Parse date from layer name
+dt_long[, date := as.Date(sub("^NDVI_", "", layer), format = "%Y%m%d")]
+
+# Scale + basic plausibility filtering
+dt_long[, ndvi := ndvi_raw / scale_factor]
+
+# If NDVI should be in [-1, 1], you can drop implausible values (often indicates NoData/scale mismatch)
+dt_long[ndvi < -1 | ndvi > 1, ndvi := NA_real_]
+
+# Add year and day-of-year (useful for “seasonal curves by year”)
+dt_long[, `:=`(year = year(date), doy = yday(date))]
+
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(mgcv)
+
+# dt_long must exist with columns: date, ndvi (and maybe pt_id)
+
+library(data.table)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+
+# dt_long must contain: date, ndvi (point-level); pt_id optional
+dt <- as.data.table(dt_long)
+dt[, date := as.Date(date)]
+dt <- dt[!is.na(ndvi)]
+
+# ---- 1) Aggregate across points per date (median + IQR) ----
+agg <- dt[, .(
+  ndvi_med = median(ndvi, na.rm = TRUE),
+  ndvi_p25 = quantile(ndvi, 0.25, na.rm = TRUE),
+  ndvi_p75 = quantile(ndvi, 0.75, na.rm = TRUE),
+  n_pts    = .N
+), by = date][order(date)]
+
+# Keep Apr–Oct only (optional, but consistent with your stacks)
+agg[, month := month(date)]
+agg <- agg[month %in% 4:10]
+
+# ---- 2) Fit GAM to the aggregated median (seasonality + interannual change) ----
+d <- copy(agg)
+d[, `:=`(
+  year_num = as.integer(year(date)),
+  doy      = as.integer(yday(date)),
+  t_year   = as.integer(year(date)) + (as.integer(yday(date)) - 1) / 365.25
+)]
+
+doy_knots <- list(doy = c(0.5, 366.5))
+
+m <- gam(
+  ndvi_med ~ s(t_year, k = 25) +
+    s(doy, bs = "cc", k = 12) +
+    ti(t_year, doy, bs = c("tp", "cc"), k = c(12, 10)),
+  data   = d,
+  knots  = doy_knots,
+  method = "REML"
+)
+
+# ---- 3) Predict daily smooth line for Apr–Oct ----
+pred_dates <- seq(min(d$date), max(d$date), by = "day")
+pred <- data.table(date = pred_dates)
+pred[, `:=`(
+  month    = month(date),
+  year_num = as.integer(year(date)),
+  doy      = as.integer(yday(date))
+)]
+pred <- pred[month %in% 4:10]
+pred[, t_year := year_num + (doy - 1) / 365.25]
+
+pred[, ndvi_hat := as.numeric(predict(m, newdata = pred))]
+
+# ---- 4) Plot: ribbon (IQR) + points (median) + smooth line ----
+p <- ggplot() +
+  #geom_ribbon(
+    #data = agg,
+    #aes(x = date, ymin = ndvi_p25, ymax = ndvi_p75),
+    #alpha = 0.25
+  #) +
+  geom_point(
+    data = agg,
+    aes(x = date, y = ndvi_med),
+    alpha = 0.7, size = 1.2
+  ) +
+  geom_line(
+    data = pred,
+    aes(x = date, y = ndvi_hat),
+    linewidth = 0.8
+  ) +
+  theme_bw() +
+  labs(
+    x = "Date",
+    y = "NDVI (median across points)",
+    title = "NDVI (Apr–Oct, 2006–2024): aggregated points + IQR ribbon + smooth seasonal trajectory"
+  )
+
+print(p)
+
