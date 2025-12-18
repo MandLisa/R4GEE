@@ -1,0 +1,280 @@
+# ============================================================
+# Phenology metrics from yearly NDVI stacks, aggregated by areas
+# - Pixel-wise metrics first, then stratify by area polygons
+# - Keeps ONLY rev_nr in {2,3,4}
+# - Renames facets: 2=Königssee, 3=Au-Schapbach, 4=Hintersee
+# - Fixed y-axis across facets per metric
+# - Handles layer names like "NDVI_20060407"
+# - Robust to NA/-Inf pixels
+# ============================================================
+
+library(terra)
+library(sf)
+library(data.table)
+library(ggplot2)
+
+suppressWarnings({
+  has_patchwork <- requireNamespace("patchwork", quietly = TRUE)
+})
+if (has_patchwork) library(patchwork)
+
+# ------------------------------------------------------------
+# USER SETTINGS (EDIT THESE)
+# ------------------------------------------------------------
+ras_dir     <- "/mnt/eo/Capra_ibex/_data/MODIS/mask"
+ras_pattern <- "MOD09Q1_NDVI_STACK_.*_cropped_corineMinusElev\\.tif$"
+
+areas_path  <- "/mnt/eo/Capra_ibex/_data/T01_reviere/T01_reviere.shp"   # <-- EDIT
+areas_layer <- NULL                                          # if gpkg, set layer name
+
+keep_rev_nr <- c(2, 3, 4)
+
+os_frac <- 0.51
+ndvi_scale_factor <- 1.0   # set to 0.0001 if NDVI is stored as int*1e4
+
+out_dir <- file.path(ras_dir, "_phenology_outputs_by_area")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------
+# Helper: parse dates from layer names like "NDVI_20060407"
+# ------------------------------------------------------------
+get_layer_dates <- function(r) {
+  nms <- names(r)
+  m <- sub(".*?((19|20)[0-9]{6}).*", "\\1", nms)
+  bad <- !grepl("^(19|20)[0-9]{6}$", m)
+  if (any(bad)) {
+    stop(
+      "Could not parse YYYYMMDD from some layer names. Examples: ",
+      paste(nms[which(bad)][1:min(5, sum(bad))], collapse = ", ")
+    )
+  }
+  as.Date(m, format = "%Y%m%d")
+}
+
+idx_max_fun <- function(v) {
+  if (all(is.na(v))) return(NA_real_)
+  which.max(v)
+}
+
+idx_os_fun <- function(v, frac = 0.51) {
+  if (all(is.na(v))) return(NA_real_)
+  m <- suppressWarnings(max(v, na.rm = TRUE))
+  if (!is.finite(m)) return(NA_real_)
+  thr <- frac * m
+  w <- which(v >= thr)
+  if (length(w) == 0) return(NA_real_)
+  w[1]
+}
+
+lm_stats_safe <- function(df, ycol, xcol = "year") {
+  df2 <- df[is.finite(df[[ycol]]) & !is.na(df[[xcol]]), ]
+  if (nrow(df2) < 2) {
+    return(data.table(beta = NA_real_, se = NA_real_, p = NA_real_, n = nrow(df2)))
+  }
+  fit <- lm(df2[[ycol]] ~ df2[[xcol]])
+  s   <- summary(fit)
+  data.table(
+    beta = unname(coef(fit)[2]),
+    se   = unname(s$coefficients[2, 2]),
+    p    = unname(s$coefficients[2, 4]),
+    n    = nrow(df2)
+  )
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("< 0.001")
+  sprintf("%.2f", p)
+}
+
+# Fixed y-axis across facets per metric (no scales="free_y")
+make_trend_plot <- function(df, ycol, ylab) {
+  
+  dfp <- df[is.finite(df[[ycol]]) & !is.na(df$year), ]
+  if (nrow(dfp) == 0) stop("No finite values available for ", ycol, ".")
+  
+  y_min <- min(dfp[[ycol]], na.rm = TRUE)
+  y_max <- max(dfp[[ycol]], na.rm = TRUE)
+  pad   <- 0.05 * (y_max - y_min)
+  if (!is.finite(pad) || pad == 0) pad <- 1
+  ylim  <- c(y_min - pad, y_max + pad)
+  
+  stats <- dfp[, lm_stats_safe(.SD, ycol), by = area_name, .SDcols = c("year", ycol)]
+  stats[, label := ifelse(
+    is.na(beta),
+    paste0("insufficient data (n=", n, ")"),
+    paste0("β = ", sprintf("%.2f", beta),
+           ", SE = ", sprintf("%.2f", se),
+           ", p = ", vapply(p, fmt_p, character(1)),
+           ", n=", n)
+  )]
+  stats[, x := min(dfp$year, na.rm = TRUE)]
+  stats[, y := y_max + 0.5 * pad]
+  
+  ggplot(dfp, aes(x = year, y = .data[[ycol]])) +
+    geom_point(size = 2) +
+    geom_smooth(method = "lm", se = TRUE) +
+    facet_wrap(~ area_name, nrow = 1) +
+    coord_cartesian(ylim = ylim) +
+    geom_text(
+      data = stats,
+      aes(x = x, y = y, label = label),
+      hjust = 0, vjust = 1.2, size = 3.8, inherit.aes = FALSE
+    ) +
+    labs(x = NULL, y = ylab) +
+    theme_bw()
+}
+
+# ------------------------------------------------------------
+# 1) Load areas, keep ONLY rev_nr {2,3,4}, rename labels
+# ------------------------------------------------------------
+if (is.null(areas_layer)) {
+  areas_sf <- st_read(areas_path, quiet = TRUE)
+} else {
+  areas_sf <- st_read(areas_path, layer = areas_layer, quiet = TRUE)
+}
+areas_sf <- st_make_valid(areas_sf)
+
+stopifnot("rev_nr" %in% names(areas_sf))
+areas_sf <- areas_sf[areas_sf$rev_nr %in% keep_rev_nr, ]
+stopifnot(nrow(areas_sf) > 0)
+
+rev_map <- c(
+  "2" = "Königssee",
+  "3" = "Au-Schapbach",
+  "4" = "Hintersee"
+)
+
+
+areas_sf$area_name <- unname(rev_map[as.character(areas_sf$rev_nr)])
+areas_sf$area_name[is.na(areas_sf$area_name)] <- paste0("rev_", areas_sf$rev_nr)
+areas_sf$area_id   <- seq_len(nrow(areas_sf))
+
+# desired facet order
+area_order <- c("Hintersee", "Au-Schapbach", "Königssee")
+
+# apply to areas (so extraction output inherits it)
+areas_sf$area_name <- factor(areas_sf$area_name, levels = area_order)
+
+# ... later, after metrics_area is created (safe)
+metrics_area[, area_name := factor(area_name, levels = area_order)]
+
+cat("Areas retained:\n")
+print(data.frame(rev_nr = areas_sf$rev_nr, area_name = areas_sf$area_name))
+
+# ------------------------------------------------------------
+# 2) Find yearly stacks
+# ------------------------------------------------------------
+ras_files <- list.files(ras_dir, pattern = ras_pattern, full.names = TRUE)
+stopifnot(length(ras_files) > 0)
+ras_files <- sort(ras_files)
+
+cat("Found", length(ras_files), "raster stacks.\n")
+cat("First file:", ras_files[1], "\n")
+
+# ------------------------------------------------------------
+# 3) Loop over stacks: pixel-wise metrics, then medians per area
+# ------------------------------------------------------------
+res_list <- vector("list", length(ras_files))
+
+for (i in seq_along(ras_files)) {
+  f <- ras_files[i]
+  message("\n--- Processing stack: ", f)
+  
+  r <- rast(f)
+  
+  # NDVI scaling if needed
+  if (!isTRUE(all.equal(ndvi_scale_factor, 1.0))) {
+    r <- r * ndvi_scale_factor
+  }
+  
+  # dates and DOY from layer names
+  dts <- get_layer_dates(r)
+  stopifnot(!any(is.na(dts)))
+  
+  yrs <- unique(format(dts, "%Y"))
+  if (length(yrs) != 1) {
+    stop("Stack appears to include multiple years: ", paste(yrs, collapse = ", "), " | file: ", f)
+  }
+  year_i <- as.integer(yrs)
+  doy <- as.integer(format(dts, "%j"))
+  stopifnot(length(doy) == nlyr(r))
+  
+  # align areas CRS to raster
+  if (st_crs(areas_sf)$wkt != crs(r)) {
+    areas_use <- st_transform(areas_sf, crs(r))
+  } else {
+    areas_use <- areas_sf
+  }
+  areas_v <- vect(areas_use)
+  
+  # Pixel-wise metrics
+  ndvi_max_r <- app(r, fun = max, na.rm = TRUE)
+  ndvi_max_r <- ifel(is.infinite(ndvi_max_r), NA, ndvi_max_r)
+  
+  idx_max_r  <- app(r, fun = idx_max_fun)
+  day_max_r  <- subst(idx_max_r, from = 1:nlyr(r), to = doy)
+  
+  idx_os_r   <- app(r, fun = function(v) idx_os_fun(v, frac = os_frac))
+  os_r       <- subst(idx_os_r, from = 1:nlyr(r), to = doy)
+  
+  len_r      <- day_max_r - os_r
+  
+  # Median per area
+  ex_ndvi <- terra::extract(ndvi_max_r, areas_v, fun = median, na.rm = TRUE)
+  ex_day  <- terra::extract(day_max_r,  areas_v, fun = median, na.rm = TRUE)
+  ex_os   <- terra::extract(os_r,       areas_v, fun = median, na.rm = TRUE)
+  ex_len  <- terra::extract(len_r,      areas_v, fun = median, na.rm = TRUE)
+  
+  dt <- data.table(
+    year           = year_i,
+    rev_nr         = areas_use$rev_nr,
+    area_id        = areas_use$area_id,
+    area_name      = areas_use$area_name,
+    NDVImax        = ex_ndvi[[2]],
+    dayNDVImax_DOY = ex_day[[2]],
+    OS_DOY         = ex_os[[2]],
+    length_greenup = ex_len[[2]]
+  )
+  
+  res_list[[i]] <- dt
+}
+
+metrics_area <- rbindlist(res_list)
+setorder(metrics_area, area_id, year)
+
+fwrite(metrics_area, file.path(out_dir, "phenology_metrics_median_by_area.csv"))
+message("\nWrote: ", file.path(out_dir, "phenology_metrics_median_by_area.csv"))
+
+cat("\nNA/non-finite counts:\n")
+print(metrics_area[, .(
+  n = .N,
+  NDVImax_bad = sum(!is.finite(NDVImax)),
+  dayMax_bad  = sum(!is.finite(dayNDVImax_DOY)),
+  OS_bad      = sum(!is.finite(OS_DOY)),
+  len_bad     = sum(!is.finite(length_greenup))
+)])
+
+# ------------------------------------------------------------
+# 4) Figures (fixed y-axis across facets)
+# ------------------------------------------------------------
+p_ndvi <- make_trend_plot(metrics_area, "NDVImax",        "NDVI max")
+p_day  <- make_trend_plot(metrics_area, "dayNDVImax_DOY", "Day of NDVI max (DOY)")
+p_os   <- make_trend_plot(metrics_area, "OS_DOY",         "Onset of spring (DOY, 51% of max)")
+p_len  <- make_trend_plot(metrics_area, "length_greenup", "Length of green-up (days)")
+
+ggsave("/mnt/eo/Capra_ibex/_figs/Fig_NDVImax_byArea_fixedY.png", p_ndvi, width = 12, height = 4, dpi = 300)
+ggsave("/mnt/eo/Capra_ibex/_figs/Fig_dayNDVImax_byArea_fixedY.png", p_day,  width = 12, height = 4, dpi = 300)
+ggsave("/mnt/eo/Capra_ibex/_figs/Fig_OS_byArea_fixedY.png",      p_os,   width = 12, height = 4, dpi = 300)
+ggsave("/mnt/eo/Capra_ibex/_figs/Fig_length_byArea_fixedY.png",  p_len,  width = 12, height = 4, dpi = 300)
+
+if (has_patchwork) {
+  p_combo <- (p_os | p_day | p_len)
+  ggsave(file.path(out_dir, "Fig_combo_OS_day_length_byArea_fixedY.png"),
+         p_combo, width = 16, height = 4.5, dpi = 300)
+}
+
+message("\nAll outputs written to: ", out_dir)
+
+# Optional display
+print(p_os); print(p_day); print(p_len); print(p_ndvi)
